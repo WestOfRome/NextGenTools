@@ -1,0 +1,326 @@
+#!/usr/bin/perl
+
+####################################
+# Devin Scannell, 2010 - 2012
+# GNU GPL v3
+####################################
+
+unless (@ARGV) {
+    print <<USAGE;
+
+    Convert fastq to fasta. Trim/toss bad reads.
+    Paired files processed in parallel to make a single fsa file, 
+    that is acceptable to SOAP or velvet. Switches to output
+    paired files and fastq (ie do filtering + trimming only).
+
+    $0 1.fsq [2.fsq] --block=i --trim5=1 --trim3=0 [--non (no 'N')]
+    [--qual=i] [--offset=64] [--outdir=xyz] [--separate] [--fsq]
+    [--newmethod] [ --stripadapters ]
+    
+    We split the input files into blocks (1M records by default) 
+    and fork as many processes as required to deal with them. 
+    This is essential for speed as disk IO is very slow. 
+
+    E.g.
+    fsq2fsa s_1_1_sequence.txt s_1_2_sequence.txt --non 
+
+    ... takes ~800s for 40M records using block=1M. There is 
+    some overhead for splitting and forking so very small blocks 
+    not recommended. 
+
+    --block : number of records per processs file. 1M. 
+    --trim5 : remove at least 1st base recommended. A >> T.  
+    --trim3 : remove 3prime bases. look at data to decide. 
+    --non   : toss any reads with N. recommended. 
+
+    --qual  : "adaptive" read trimming/tossing. if only one read shows 
+              low quality, we send its pair to a SE file.
+              we impose 3 quality criteria:
+              1. the average must be > --qual
+	      2. the 3prime is trimmed until last base > --qual. toss if shorter than 31bp. 
+	      3. there can be no run of >=3 bases < --qual in remainder of read 
+
+    --newmethod : 
+        1. trim 3prime until we have a 3 base window with all scores >= X 
+        2. check average score in remainder of read >= X 
+        3. ensure read >= 31bp 
+        
+    --offset : convert illumina fastq to numerical phred scores. 
+    --outdir : place temp files in this dir. defaults to time(). 
+    --separate: place paired reads in separate files (like illumina). 
+                required for sending files to soap.Correction etc. 
+    --fsq : output fastq not fasta. 
+	      
+    NB : cat \$(ls --color=never read1_* | sort -n  ) > new 
+
+USAGE
+    exit;
+}
+
+
+#############################################
+#############################################
+
+use Getopt::Long;
+
+local $\ = "\n";
+local $/ = "\n";
+local $, = "\t";
+
+my $originaltime=time;
+
+$block = 4000000; # 1M records 
+$offset = 64;
+$trim5 = 0;
+$trim3 = 0;
+$outdir = $originaltime;
+
+GetOptions(
+    'newmethod' => \$newmethod,
+	   'trim5=i' => \$trim5,
+	   'trim3=i' => \$trim3,
+'stripadapters' => \$stripadapters,
+	   # 
+	   'non' => \$non,
+	   'qual=i' => \$qual,
+	   # 
+	   'fsq' => \$fsq,
+	   'fastq' => \$fsq,	   
+	   'outdir=s' => \$outdir,
+	   'separate' => \$separate,
+	   # 
+	   'block=i' => \$block,
+	   'offset=i' => \$offset,
+	   );
+
+die unless $block%4==0;
+
+# options 
+
+my ($file1, $file2) = @ARGV;
+
+mkdir($outdir) || die;
+chdir($outdir);
+symlink("../$file1", $file1);
+system("split -a 3 -d -l $block $file1 read1_");
+if ( $file2 ) {
+    symlink("../$file2", $file2);
+    system("split -a 3 -d -l $block $file2 read2_");
+}
+
+my $format = ( $fsq ? \&fastq : \&fasta );
+
+#############################################
+#############################################
+
+# start parallel processes 
+
+while (my $block1 = <read1_*> ) {
+    
+    my $pid;
+    next if $pid = fork(); # spawn child processes 
+    print "Fork:", $$, $block1, ($block/4)." reads";
+
+    ################################
+    # begin child execution 
+
+    # open required files 
+
+    $block1 =~ /read1_(\d+)/;
+    my $block2 = "read2_$1";
+    my $block_id = $1;
+
+    open(my $fh1, $block1) || die;
+    open(my $fh2, $block2) if $file2; # 1 
+    open(my $fh_se, ">$block_id".'.se.fsa') || die;
+    open(my $fh_pe, ">$block_id".'.pe.fsa') if $file2; # 2 
+
+    # for soap.kmerfreq / kmer.corrector 
+    
+    my $fh_pe2;
+    if ( $separate ) {
+	    open($fh_pe2, ">$block_id".'.pe2.fsa');
+    } else {$fh_pe2=$fh_pe;}
+
+    # read in record(s) (pairs)
+    # and write out fsq/fsa 
+    
+    while ( my $rec1 = &getRecord($fh1) ) { 
+	    $rec1 = &processRecord( $rec1 );      
+	
+	if ( $file2 ) { # 3
+	    my $rec2 =  &getRecord($fh2) || die;	
+	    $rec2 = &processRecord( $rec2 );
+	  
+	    if ( $rec1 && $rec2 ) {
+            $format->($fh_pe, $rec1);
+            $format->($fh_pe2, $rec2);            
+	    } elsif ( $rec1 ) {
+            $format->($fh_se, $rec1);
+	    } elsif ( $rec2 ) {
+            $format->($fh_se, $rec2);
+	    }
+	    
+	} elsif ( $rec1 ) {
+        $format->($fh_se, $rec1);
+    }
+    }
+    
+    close($fh_se);
+    close($fh_pe);
+    close($fh_pe2);    
+    close($fh1);
+    close($fh2);
+    unlink($block1);
+    unlink($block2);
+    exit 0; # end child execution 
+    ################################
+
+}
+
+#############################################
+#############################################
+
+# back in parent land 
+# wait for children to finish 
+# we have equal size jobs so can just wait for kids 
+# to finish -- no need for fancy SIG catching. 
+
+$oldtime = time;
+while (wait() != -1) { # wit returns the # of children outstanding 
+    $time = time;
+    print $time, ($time-$oldtime), wait();
+    $oldtime = $time;
+    sleep(10);
+}
+
+# finish up 
+
+system('cat $(ls --color=never *.se.fsa | sort -n  ) > ../'.$outdir.'.se.fsa');
+system('cat $(ls --color=never *.pe.fsa | sort -n  ) > ../'.$outdir.'.pe.fsa') if $file2;
+system('cat $(ls --color=never *.pe2.fsa | sort -n  ) > ../'.$outdir.'.pe2.fsa') if $file2 && $separate;
+
+$time = time;
+print "Time", ($time-$originaltime);
+print "Temp Data in $outdir/.";
+exit;
+
+
+#############################################
+#############################################
+
+sub fasta {
+    my $fh = shift;
+    my $rec = shift;
+    print $fh join("\n", '>'.$rec->{'ID'}, join('', @{$rec->{'SEQ'}}) );
+}
+
+sub fastq {
+    my $fh = shift;
+    my $rec = shift;
+    print $fh join("\n", 
+        '@'.$rec->{'ID'}, 
+        join('', @{$rec->{'SEQ'}}), 
+        '+'.$rec->{'ID'}, 
+        join('', @{$rec->{'QUAL'}})
+        );
+}
+
+sub getRecord {
+    my $fh = shift;
+    return unless my $id = <$fh>;
+
+    chomp($id);
+    $id =~ s/^\@//;
+    chomp(my @seq = grep {/\S/} split//, <$fh>);
+    <$fh>;
+    chomp(my @qual = grep {/\S/} split//, <$fh>);
+    my @nqual = map {(ord($_)-$offset)} @qual;
+    return { ID => $id, SEQ => \@seq, QUAL => \@qual, NQUAL => \@nqual};
+} 
+
+sub processRecord {
+    my $rec = shift;
+
+    # hard trim arrays 
+    
+    foreach my $key ( qw(SEQ QUAL NQUAL) ) {
+        splice(@{$rec->{ $key }}, (scalar( @{$rec->{ $key }} )-$trim3), $trim3);
+        splice(@{$rec->{ $key }}, 0, $trim5);
+    }
+
+    if ( $stripadapters ) {
+	my $seq = join('', @{$rec->{ 'SEQ' }} );
+	return undef if $seq =~ /GATCGGAAGAGCGGTT|GAGCGGTTCAGCAGGAA|AGCAGGAATGCCGAG/;
+	my @cpy=@{$rec->{ 'SEQ' }};
+	my $rcseq = join('', map {tr/ATGCN/TACGN/; $_} reverse ( @cpy ) );
+	return undef if $rcseq =~ /GATCGGAAGAGCGGTT|GAGCGGTTCAGCAGGAA|AGCAGGAATGCCGAG/;
+    }
+
+    # get crazy 
+
+    map {return undef if $_ eq 'N'} @{$rec->{'SEQ'}} if $non;
+
+    # examine the quality array  
+
+    if ( $qual && $newmethod ) {
+        # trim until we find an OK 3-base window 
+
+    my $ok;
+	for ( my $i=( $#{$rec->{'NQUAL'}} -1); $i >=29 ; $i-- ) {
+        $ok = $i;        
+	    last if ($rec->{'NQUAL'}->[$i-1] >= $qual && $rec->{'NQUAL'}->[$i] >= $qual && $rec->{'NQUAL'}->[$i+1] >= $qual);
+    }
+    return undef unless $ok >= 30;
+
+    pop(@{$rec->{'NQUAL'}}) until $#{$rec->{'NQUAL'}} == $ok;
+    
+	my $total;
+	map { $total += $_ } @{$rec->{'NQUAL'}}; 
+    return undef unless $total/$ok > $qual;
+
+
+    
+    } elsif ( $qual ) {
+	my $total; 
+	    map { $total += $_ } @{$rec->{'NQUAL'}};
+    	return undef unless $total/scalar(@{$rec->{'NQUAL'}}) > $qual;
+	    pop(@{$rec->{'NQUAL'}}) until $rec->{'NQUAL'}->[$#qual] >= $qual; # find the first (last) hihg Q base
+    	return undef unless $#{$rec->{'NQUAL'}} >= 30;
+
+        # abandon read if there is a 3-base window with low quality 
+        
+	    for my $i ( 1..( $#{$rec->{'NQUAL'}} -1) ) {
+	        return undef if ($rec->{'NQUAL'}->[$i-1] < $qual 
+	            && $rec->{'NQUAL'}->[$i] < $qual && $rec->{'NQUAL'}->[$i+1] < $qual);
+    	}
+    }
+    
+    # update arrays 
+    
+    foreach my $key ( qw(SEQ QUAL) ) {
+        $rec->{ $key } = [ @{$rec->{ $key }}[0..$#{$rec->{'NQUAL'}}] ];
+    }
+
+    return( $rec );
+}
+
+
+#############################################
+# OLD CODE 
+#############################################
+
+# prep input files 
+
+if ( $processes > 1 ) {
+    my $wc = `wc -l $file1`;
+    $wc =~ /(\d+)\s+\w+/;
+    die unless $1%4==0;
+    my $records = $1/4;
+    my $block = int(($records/($processes-1)))*4;
+
+} else {
+    symlink($file1, "read1_01");
+    symlink($file2, "read2_01") if $file2;
+}
+
