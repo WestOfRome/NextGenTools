@@ -99,7 +99,7 @@ die unless $block%4==0;
 
 my ($file1, $file2) = @ARGV;
 
-mkdir($outdir) || die;
+mkdir($outdir) || die($outdir);
 chdir($outdir);
 symlink("../$file1", $file1);
 system("split -a 3 -d -l $block $file1 read1_");
